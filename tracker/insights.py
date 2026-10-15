@@ -9,9 +9,6 @@ from datetime import date, datetime, timedelta, timezone
 from . import config
 
 SHORT_SESSION_S = 10 * 60
-# Project switches per active day (calibrated on real history: median ~6, top quartile 13+).
-SWITCHY_PER_DAY = 10
-CALM_PER_DAY = 3
 TOTAL_KEYS = ("sessions", "active_s", "flow_s", "wall_s", "prompts", "interruptions", "rejections", "errors",
               "edits", "tests_run", "tokens_in", "tokens_out", "idle_gaps", "area_switches", "topic_shifts")
 # (db column, decoded key, empty value). 'prompts' stays the integer count.
@@ -342,13 +339,14 @@ def coach(sessions: list[dict], summary: dict, prev: dict | None = None) -> list
                     "Protect that slot for hard problems; keep reviews and chores for the rest."})
     # switching
     sw = T["switches_per_day"]
-    if sw >= SWITCHY_PER_DAY:
+    cfg = config.load()
+    if sw >= cfg["switchy_switches_per_day"]:
         msg = (f"You switch projects {sw:.1f}× per active day (a switch = your next prompt goes to a different "
                "project). Each one costs re-load time; batch work per repo where you can.")
         if prev and prev["totals"]["switches_per_day"]:
             msg += f" (previous period: {prev['totals']['switches_per_day']:.1f})"
         out.append({"kind": "watch", "text": msg})
-    elif T["projects"] > 1 and sw <= CALM_PER_DAY:
+    elif T["projects"] > 1 and sw <= cfg["calm_switches_per_day"]:
         out.append({"kind": "win", "text": f"Low context switching ({sw:.1f} project switches/day) across {T['projects']} projects."})
     # parallel sessions
     if T["active_s"] and T["parallel_s"] / T["active_s"] >= 0.3 and T["clock_s"] >= 3600:
@@ -417,8 +415,10 @@ def overview(conn: sqlite3.Connection, start: str, end: str, category: str | Non
     summ = summarize(sess)
     ps, pe = previous_range(start, end)
     prev = summarize(load_sessions(conn, ps, pe, category))
+    from . import goals   # imported here: goals builds on this module
+    goal_lines = goals.period_lines(goals.progress(conn, goals.list_goals(conn), end, 7))
     return {"range": {"start": start, "end": end}, "summary": summ, "previous": prev["totals"],
-            "coach": coach(sess, summ, prev)}
+            "coach": goal_lines + coach(sess, summ, prev)}
 
 
 def projects_overview(conn: sqlite3.Connection, category: str | None = None) -> list[dict]:

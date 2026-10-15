@@ -31,6 +31,10 @@ DEFAULTS = {
     "default_category": "personal",
     "sprint_length_days": 21,
     "refinement_length_days": 7,
+    # Project switches per active day: at or above "switchy" the coach warns, at or below "calm" it praises.
+    # Tune to how many repos you really juggle.
+    "switchy_switches_per_day": 10,
+    "calm_switches_per_day": 3,
 }
 
 

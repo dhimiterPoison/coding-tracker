@@ -12,7 +12,7 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(tmp_path / "claude"))
     import tracker.config as config
     importlib.reload(config)
-    for name in ("db", "sync", "insights", "day", "reports", "server"):
+    for name in ("db", "sync", "insights", "day", "goals", "journal", "reports", "server"):
         importlib.reload(importlib.import_module(f"tracker.{name}"))
     return tmp_path
 

@@ -16,6 +16,11 @@ function h(tag, attrs, ...kids) {
   for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid.nodeType ? kid : document.createTextNode(kid));
   return el;
 }
+// Like el.append, but skips null/false (Element.append would print the word "null").
+function put(el, ...kids) {
+  for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid.nodeType ? kid : document.createTextNode(kid));
+  return el;
+}
 function svg(tag, attrs, ...kids) {
   const el = document.createElementNS(SVGNS, tag);
   for (const [k, v] of Object.entries(attrs || {})) el.setAttribute(k, v);
@@ -36,6 +41,8 @@ const state = {
   cfg: { work_types: [] },
   filters: { q: "", type: "", project: "" },
   report: store.get("report", "refinement"),
+  day: "",            // selected day on the Day tab (YYYY-MM-DD); empty means today
+  editingDay: false,  // reflection form open on an already-closed day
 };
 
 const iso = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
@@ -144,10 +151,14 @@ function legend(types) {
 // ───────── views ─────────
 async function viewOverview() {
   const r = range();
-  const d = await api(`/api/overview?${qs({ ...r, category: state.cat })}`);
+  const [d, morning] = await Promise.all([
+    api(`/api/overview?${qs({ ...r, category: state.cat })}`),
+    api("/api/morning").catch(() => null),
+  ]);
   const T = d.summary.totals, P = d.previous;
   const root = h("div", {});
   root.append(h("h1", {}, "Overview"), h("p", { class: "sub" }, `${r.start} to ${r.end} · compared with the ${Math.round((new Date(r.end) - new Date(r.start)) / 864e5) + 1} days before`));
+  const mc = morningCard(morning); if (mc) root.append(mc);
   if (!T.sessions) { root.append(h("div", { class: "card empty" }, "No sessions in this range. Pick a longer range, press Sync, or log a session manually.")); return root; }
   root.append(h("div", { class: "kpis" },
     kpi("Time on the clock", dur(T.clock_s), delta(T.clock_s, P.clock_s, { fmt: dur }), T.parallel_s > 600 ? `${dur(T.active_s)} of session time (${dur(T.parallel_s)} ran in parallel)` : ""),
@@ -292,6 +303,217 @@ async function viewReports() {
   return root;
 }
 
+// ───────── goals, day, morning ─────────
+const GSTAT = { met: ["✓", "Met"], partly: ["◐", "Partly"], missed: ["○", "Not today"], na: ["–", "n/a"] };
+const addDays = (isoStr, n) => { const d = new Date(isoStr + "T12:00:00"); d.setDate(d.getDate() + n); return iso(d); };
+const goalDots = (dots) => h("span", { class: "gdots", role: "img", "aria-label": dots.length ? dots.map((x) => x.status).join(", ") : "no judged days yet" },
+  dots.length ? dots.map((x) => h("i", { class: `g g-${x.status}`, title: `${dayLabel(x.day)}: ${GSTAT[x.status][1]}` })) : h("span", { class: "meta" }, "no judged days yet"));
+const gchip = (status) => h("span", { class: `gchip gc-${status}` }, `${GSTAT[status][0]} ${GSTAT[status][1]}`);
+
+function morningCard(m) {
+  if (!m || (!m.steps.length && !m.goals.length) || store.get("morning-" + iso(new Date()), false)) return null;
+  const when = m.from_day ? (m.days_ago === 1 ? "yesterday" : m.days_ago === 0 ? "today" : dayLabel(m.from_day)) : "";
+  const body = h("section", { class: "card morning" },
+    h("div", { class: "row", style: { margin: "0 0 8px" } },
+      h("h2", { style: { margin: 0 } }, "Pick up where you left off"),
+      m.steps.length ? h("span", { class: "tag" }, m.source === "you" ? `your next steps · ${when}` : `last prompts · ${when}`) : null,
+      h("span", { class: "spacer" }),
+      m.from_day ? h("button", { class: "ghost", onclick: () => { state.day = m.from_day; state.view = "day"; store.set("view", "day"); render(); } }, "Open that day") : null,
+      h("button", { class: "ghost", onclick: () => { store.set("morning-" + iso(new Date()), true); body.remove(); } }, "Hide for today")));
+  if (m.steps.length) body.append(h("ul", { class: "steps" }, m.steps.map((s) => h("li", {},
+    h("b", {}, s.project), " ", s.text, s.worked_since ? h("span", { class: "tag", style: { marginLeft: "8px" } }, "worked on since") : null))));
+  if (m.goals.length) body.append(h("div", { class: "goalrow" }, m.goals.map((g) => h("span", { class: "goalmini", title: g.title },
+    h("span", { class: "gname" }, g.title), goalDots(g.dots), h("span", { class: "meta" }, `${g.met}/${g.target}`)))));
+  return body;
+}
+
+function projectColor(name, order) { return `var(--p${(order.indexOf(name) % 8) + 1})`; }
+function dayTimeline(rev) {
+  const mins = (s) => { const [a, b] = s.split(":").map(Number); return a * 60 + b; };
+  const items = rev.stretches.map((s) => { const a = mins(s.start); let b = mins(s.end); if (b <= a) b += 1440; return { ...s, a, b }; });
+  if (!items.length) return null;
+  const projects = [...new Set(items.map((s) => s.project))];
+  const lo = Math.max(0, Math.floor(Math.min(...items.map((s) => s.a)) / 60) * 60);
+  const hi = Math.min(1440, Math.max(lo + 360, Math.ceil(Math.max(...items.map((s) => s.b)) / 60) * 60));
+  const L = 120, W = 640, laneH = 24, gap = 8, T = 6;
+  const H = T + projects.length * (laneH + gap) + 40;
+  const x = (m) => L + ((m - lo) / (hi - lo)) * (W - L - 8);
+  const root = svg("svg", { viewBox: `0 0 ${W} ${H}`, width: "100%", role: "img", "aria-label": "Timeline of focus stretches per project" });
+  const step = hi - lo > 720 ? 180 : 60;
+  for (let m = lo; m <= hi; m += step) root.append(svg("line", { class: "grid-line", x1: x(m), x2: x(m), y1: T, y2: H - 30 }), svg("text", { x: x(m), y: H - 14, "text-anchor": "middle" }, `${String(Math.floor(m / 60) % 24).padStart(2, "0")}:00`));
+  projects.forEach((p, i) => {
+    const y = T + i * (laneH + gap);
+    root.append(svg("text", { x: L - 8, y: y + laneH / 2 + 4, "text-anchor": "end" }, p.length > 16 ? p.slice(0, 15) + "…" : p));
+    root.append(svg("rect", { x: L, y, width: W - L - 8, height: laneH, rx: 4, fill: "var(--surface-2)", opacity: 0.55 }));
+  });
+  for (const s of items) {
+    const y = T + projects.indexOf(s.project) * (laneH + gap);
+    root.append(svg("g", {}, svg("title", {}, `${s.start}–${s.end} · ${s.project} · ${s.minutes}m · ${s.prompts} prompts${s.interruptions ? " · " + s.interruptions + " interruptions" : ""}\n${s.title}`),
+      svg("rect", { x: x(s.a), y, width: Math.max(2, x(s.b) - x(s.a)), height: laneH, rx: 4, fill: projectColor(s.project, projects) })));
+  }
+  for (const b of rev.interruption_bursts) {
+    const y = T + Math.max(0, projects.indexOf(b.project)) * (laneH + gap);
+    root.append(svg("g", {}, svg("title", {}, `${b.count} interruptions ${b.start}–${b.end}`), svg("rect", { x: x(mins(b.start)), y: y - 3, width: Math.max(4, x(mins(b.end)) - x(mins(b.start))), height: laneH + 6, rx: 4, fill: "none", stroke: "var(--watch)", "stroke-width": 2 })));
+  }
+  const cy = T + projects.length * (laneH + gap) + 4;
+  root.append(svg("text", { x: L - 8, y: cy + 4, "text-anchor": "end" }, "commits"));
+  for (const c of rev.commits) root.append(svg("g", {}, svg("title", {}, `${c.time} [${c.project}] ${c.msg}`), svg("circle", { cx: x(mins(c.time)), cy, r: 4, fill: projectColor(c.project, projects) })));
+  const wrap = h("div", {}, root, h("div", { class: "legend" }, projects.map((p) => h("span", {}, h("i", { class: "dot", style: { background: projectColor(p, projects) } }), p)),
+    rev.interruption_bursts.length ? h("span", {}, h("i", { class: "dot", style: { background: "none", border: "2px solid var(--watch)" } }), "interruption burst") : null));
+  return wrap;
+}
+
+function dayStrip(days, selected, today) {
+  const max = Math.max(3600, ...days.map((d) => d.clock_s));
+  const el = h("div", { class: "strip", role: "group", "aria-label": "Recent days" }, days.map((d) => h("button", {
+    class: "chip" + (d.day === selected ? " sel" : "") + (d.closed ? " closed" : ""), "aria-pressed": String(d.day === selected),
+    title: `${dayLabel(d.day)} · ${dur(d.clock_s)} on the clock${d.closed ? " · closed" : ""}${d.win ? " · " + d.win : ""}`,
+    onclick: () => { state.day = d.day; state.editingDay = false; render(); } },
+    h("span", { class: "dow" }, new Date(d.day + "T12:00:00").toLocaleDateString([], { weekday: "short" })),
+    h("span", { class: "dnum" }, String(Number(d.day.slice(8)))),
+    h("span", { class: "bar" }, h("i", { style: { height: `${Math.round((d.clock_s / max) * 100)}%` } })),
+    h("span", { class: "mark" }, d.closed ? "✓" + (d.feeling ? " " + d.feeling : "") : d.day === today ? "•" : " "))));
+  requestAnimationFrame(() => { const s = el.querySelector(".sel"); if (s) el.scrollLeft = s.offsetLeft - el.clientWidth / 2 + s.offsetWidth / 2; });
+  return el;
+}
+
+async function viewDay() {
+  const today = iso(new Date());
+  const day = state.day || today;
+  const start = addDays(today, -13) < addDays(day, -3) ? addDays(today, -13) : addDays(day, -3);
+  const [rev, strip] = await Promise.all([
+    api(`/api/day/${day}?${qs({ category: state.cat })}`),
+    api(`/api/days?${qs({ start, end: today > day ? today : day, category: state.cat })}`),
+  ]);
+  const closed = rev.closed;
+  const root = h("div", {});
+  const nav = (n) => h("button", { class: "ghost", "aria-label": n < 0 ? "Previous day" : "Next day", onclick: () => { state.day = addDays(day, n); state.editingDay = false; render(); } }, n < 0 ? "‹" : "›");
+  root.append(h("div", { class: "row", style: { margin: "0 0 4px" } }, h("h1", { style: { margin: 0 } }, new Date(day + "T12:00:00").toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" })),
+    nav(-1), day < today ? nav(1) : null,
+    closed ? h("span", { class: "gchip gc-met" }, `✓ Closed ${hhmm(closed.closed_at)}`) : h("span", { class: "gchip gc-na" }, day === today ? "Open · still going" : "Not closed")));
+  root.append(h("p", { class: "sub" }, "Your day in one page: what happened, where flow held and broke, how your goals did, and what to pick up tomorrow."), dayStrip(strip, day, today));
+  if (rev.empty) { root.append(h("div", { class: "card empty", style: { marginTop: "16px" } }, "No sessions recorded for this day. Press Sync, or log work Claude did not see.")); return root; }
+  const T = rev.totals, ds = rev.day_stats;
+  root.append(h("div", { class: "kpis", style: { marginTop: "16px" } },
+    kpi("On the clock", dur(T.clock_s), h("div", { class: "d" }, `${rev.span.start}–${rev.span.end}`)),
+    kpi("Focus stretches", rev.focus_stretches, h("div", { class: "d" }, rev.longest_stretch ? `longest ${dur(rev.longest_stretch.minutes * 60)}` : "none yet")),
+    kpi("Project switches", ds.switches, h("div", { class: "d" }, rev.baseline ? `usual ${Math.round(rev.baseline.switches)}` : " ")),
+    kpi("Interruptions", ds.interruptions, h("div", { class: "d" }, " ")),
+    kpi("Commits", T.commits, h("div", { class: "d" }, `${T.sessions} sessions`))));
+  const tl = dayTimeline(rev);
+  if (tl) root.append(h("section", { class: "card", style: { marginBottom: "16px" } }, h("h2", {}, "Timeline"), tl));
+  root.append(h("div", { class: "grid cols-2", style: { marginBottom: "16px" } },
+    h("section", { class: "card" }, h("h2", {}, "Coach"), rev.findings.length ? h("ul", { class: "coach" }, rev.findings.map((c) => h("li", { class: c.kind }, h("span", { class: "badge" }, { win: "Going well", watch: "Watch", tip: "Try" }[c.kind]), h("span", {}, c.text)))) : h("p", { class: "meta" }, "Nothing stood out today.")),
+    h("section", { class: "card" }, h("h2", {}, "Goals"), goalsList(rev.goals))));
+  root.append(h("div", { class: "grid cols-2", style: { marginBottom: "16px" } },
+    h("section", { class: "card" }, h("h2", {}, "Shipped"), rev.commits.length ? h("ul", { class: "plain" }, rev.commits.map((c) => h("li", {}, h("span", { class: "meta" }, `${c.time} `), h("b", {}, `[${c.project}] `), c.msg))) : h("p", { class: "meta" }, "No commits recorded.")),
+    h("section", { class: "card" }, h("h2", {}, "Where you left off"), h("ul", { class: "plain" }, Object.entries(rev.left_off).map(([p, lo]) => h("li", {}, h("b", {}, p), ": ", lo.last_prompt, lo.state ? h("div", { class: "meta" }, "→ " + lo.state) : null))))));
+  root.append(reflectCard(rev, day));
+  return root;
+}
+
+function goalsList(gs) {
+  if (!gs.length) return h("p", { class: "meta" }, "No goals yet. Add a few on the Goals tab and they will be judged here every day.");
+  return h("ul", { class: "plain goals" }, gs.map((g) => h("li", {},
+    h("div", { class: "row", style: { margin: 0 } }, h("b", {}, g.title), gchip(g.status), h("span", { class: "spacer" }), goalDots(g.week.dots), h("span", { class: "meta" }, `${g.week.met}/${g.week.target} this week`)),
+    g.detail ? h("div", { class: "meta" }, g.detail) : null)));
+}
+
+function reflectCard(rev, day) {
+  const c = rev.closed;
+  const card = h("section", { class: "card reflect" });
+  const projects = rev.by_project.map((p) => p.project);
+  if (c && !state.editingDay) {
+    put(card, h("h2", {}, "Your reflection"),
+      c.stale ? h("p", { class: "gchip gc-partly" }, "Sessions changed since you closed this day. Update the entry to refresh it.") : null,
+      c.feeling ? h("div", { class: "stars" }, h("span", { class: "meta" }, "Felt "), "★".repeat(c.feeling) + "☆".repeat(5 - c.feeling)) : null,
+      c.win ? h("p", {}, h("b", {}, "Win: "), c.win) : null,
+      Object.keys(c.next_steps).length ? h("div", {}, h("b", {}, "Next steps"), h("ul", { class: "plain" }, Object.entries(c.next_steps).map(([p, t]) => h("li", {}, h("b", {}, p + ": "), t)))) : null,
+      c.notes ? h("p", { class: "meta", style: { whiteSpace: "pre-wrap" } }, c.notes) : null,
+      c.narrative ? h("div", { class: "left-off", style: { whiteSpace: "pre-wrap" } }, h("small", {}, "Written review"), c.narrative) : null,
+      h("div", { class: "row" },
+        h("button", { class: "ghost", onclick: () => { state.editingDay = true; render(); } }, "Edit"),
+        h("button", { class: "ghost", onclick: async () => { if (!confirm("Reopen this day? Your reflection will be removed (the sessions stay).")) return; await api(`/api/day/${day}/close`, { method: "DELETE" }); toast("Day reopened"); render(); } }, "Reopen")));
+    return card;
+  }
+  let feeling = c?.feeling || 0;
+  const stars = h("span", { class: "stars", role: "group", "aria-label": "How did the day feel?" });
+  const paint = () => stars.replaceChildren(...[1, 2, 3, 4, 5].map((i) => h("button", { type: "button", class: i <= feeling ? "on" : "", "aria-label": `${i} of 5`, onclick: () => { feeling = i; paint(); } }, "★")));
+  paint();
+  const win = h("input", { placeholder: "One thing that went well today", value: c?.win || "", maxlength: 1000 });
+  const steps = projects.map((p) => {
+    const lo = rev.left_off[p];
+    return { p, el: h("input", { placeholder: lo?.last_prompt ? "e.g. continue: " + lo.last_prompt.slice(0, 70) : "First step tomorrow", value: c?.next_steps?.[p] || "", maxlength: 500 }) };
+  });
+  const answers = {};
+  const manual = rev.goals.filter((g) => g.metric === "manual");
+  const manualRows = manual.map((g) => {
+    answers[g.id] = c?.goal_answers?.[g.id]?.status || (g.auto === false && g.status !== "na" ? g.status : "");
+    const grp = h("span", { class: "seg", role: "group", "aria-label": g.title });
+    const paintG = () => grp.replaceChildren(...["met", "partly", "missed"].map((s) => h("button", { type: "button", "aria-pressed": String(answers[g.id] === s), onclick: () => { answers[g.id] = answers[g.id] === s ? "" : s; paintG(); } }, GSTAT[s][1])));
+    paintG();
+    return h("div", { class: "row", style: { margin: "4px 0" } }, h("span", {}, g.title), h("span", { class: "spacer" }), grp);
+  });
+  const notes = h("textarea", { rows: 3, placeholder: "Anything else worth remembering (private)", maxlength: 5000 }, c?.notes || "");
+  const save = h("button", { class: "primary", type: "button", onclick: async () => {
+    const body = { feeling: feeling || null, win: win.value, notes: notes.value, next_steps: Object.fromEntries(steps.map((s) => [s.p, s.el.value])) };
+    const ga = Object.fromEntries(Object.entries(answers).filter(([, v]) => v).map(([k, v]) => [k, { status: v }]));
+    if (Object.keys(ga).length) body.goal_answers = ga;
+    if (!body.feeling) delete body.feeling;
+    try { await api(`/api/day/${day}/close?${qs({ category: state.cat })}`, { method: "POST", body }); state.editingDay = false; toast(c ? "Day updated" : "Day closed"); render(); } catch (e) { toast(e.message); }
+  } }, c ? "Update the day" : "Close the day");
+  put(card, h("h2", {}, c ? "Edit your reflection" : "Close the day"),
+    h("p", { class: "meta", style: { marginTop: "-6px" } }, "Takes a minute. Saves a frozen copy of this review, feeds your retro, and shows your next steps tomorrow morning."),
+    h("div", { class: "row" }, h("span", {}, "How did it feel?"), stars),
+    h("label", { class: "f" }, "One win", win),
+    h("div", { style: { margin: "12px 0 4px" } }, h("b", {}, "First step tomorrow, per project")),
+    h("div", { class: "form", style: { gridTemplateColumns: "140px 1fr", alignItems: "center", gap: "8px" } }, steps.flatMap((s) => [h("span", { class: "meta" }, s.p), s.el])),
+    manualRows.length ? h("div", { style: { margin: "12px 0 4px" } }, h("b", {}, "Your goals (self-reported)")) : null, ...manualRows,
+    h("label", { class: "f", style: { marginTop: "12px" } }, "Notes", notes),
+    h("div", { class: "row" }, save, c ? h("button", { class: "ghost", type: "button", onclick: () => { state.editingDay = false; render(); } }, "Cancel") : null));
+  return card;
+}
+
+async function viewGoals() {
+  const [cur, long] = await Promise.all([api("/api/goals?window=7"), api("/api/goals?window=28")]);
+  const longBy = Object.fromEntries(long.goals.map((g) => [g.id, g]));
+  const root = h("div", {}, h("h1", {}, "Goals"),
+    h("p", { class: "sub" }, "Practices you are working on, not outcomes. Each is judged per day from your sessions (or by you), counted against a weekly target. Quiet days do not count against you. They also shape the coach and your day review."));
+  const active = cur.goals.filter((g) => g.active), archived = cur.goals.filter((g) => !g.active);
+  const refresh = () => render();
+  const card = (g) => {
+    const l = longBy[g.id];
+    const target = h("select", { "aria-label": `Target per week for ${g.title}` }, [1, 2, 3, 4, 5, 6, 7].map((n) => h("option", { value: n, selected: n === g.target_per_week }, `${n}× / week`)));
+    target.addEventListener("change", async () => { await api(`/api/goals/${g.id}`, { method: "PATCH", body: { target_per_week: Number(target.value) } }); toast("Target updated"); refresh(); });
+    return h("section", { class: "card goalcard" },
+      h("div", { class: "row", style: { margin: 0 } }, h("h2", { style: { margin: 0 } }, g.title), h("span", { class: "tag" }, cur.metrics[g.metric]), h("span", { class: "spacer" }), target),
+      g.why ? h("p", { class: "meta", style: { margin: "6px 0" } }, g.why) : null,
+      h("div", { class: "row", style: { margin: "6px 0 0" } }, goalDots(g.dots), h("span", {}, `${g.met} of ${g.target} this week`),
+        l && l.judged ? h("span", { class: "meta" }, `· last 4 weeks: ${l.met} of ${l.judged} judged days`) : null, h("span", { class: "spacer" }),
+        h("button", { class: "ghost", onclick: async () => { await api(`/api/goals/${g.id}`, { method: "PATCH", body: { active: !g.active } }); refresh(); } }, g.active ? "Archive" : "Restore"),
+        !g.active ? h("button", { class: "danger", onclick: async () => { if (confirm(`Delete "${g.title}" for good?`)) { await api(`/api/goals/${g.id}`, { method: "DELETE" }); refresh(); } } }, "Delete") : null));
+  };
+  root.append(active.length ? h("div", { class: "grid" }, active.map(card)) : h("div", { class: "card empty" }, "No goals yet. Pick a few below. Two or three is plenty."));
+  const have = new Set(cur.goals.map((g) => g.title));
+  const tmpl = cur.templates.filter((t) => !have.has(t.title));
+  if (tmpl.length) root.append(h("h2", { style: { margin: "24px 0 10px" } }, "Start from a template"),
+    h("div", { class: "grid cols-2" }, tmpl.map((t) => h("section", { class: "card" },
+      h("b", {}, t.title), h("p", { class: "meta", style: { margin: "4px 0 8px" } }, t.why),
+      h("div", { class: "row", style: { margin: 0 } }, h("span", { class: "tag" }, cur.metrics[t.metric]), h("span", { class: "tag" }, `${t.target_per_week}× / week`), h("span", { class: "spacer" }),
+        h("button", { class: "ghost", onclick: async () => { await api("/api/goals", { method: "POST", body: t }); toast("Goal added"); refresh(); } }, "Add"))))));
+  const title = h("input", { placeholder: "e.g. Explain my design choices in the PR description", maxlength: 200 });
+  const why = h("input", { placeholder: "Why it matters to you (optional)", maxlength: 1000 });
+  const metric = h("select", {}, Object.entries(cur.metrics).map(([k, v]) => h("option", { value: k }, k === "manual" ? "Self-reported: " + v : "Auto: " + v)));
+  const tgt = h("select", {}, [1, 2, 3, 4, 5, 6, 7].map((n) => h("option", { value: n, selected: n === 3 }, `${n}× / week`)));
+  root.append(h("h2", { style: { margin: "24px 0 10px" } }, "Write your own"), h("section", { class: "card" }, h("div", { class: "form" },
+    h("label", { class: "f wide" }, "Goal", title), h("label", { class: "f wide" }, "Why", why), h("label", { class: "f" }, "How to track it", metric), h("label", { class: "f" }, "Target", tgt),
+    h("div", { class: "row wide" }, h("button", { class: "primary", onclick: async () => {
+      try { await api("/api/goals", { method: "POST", body: { title: title.value, why: why.value, metric: metric.value, target_per_week: Number(tgt.value) } }); toast("Goal added"); refresh(); } catch (e) { toast(e.message); }
+    } }, "Add goal")))));
+  if (archived.length) root.append(h("h2", { style: { margin: "24px 0 10px" } }, "Archived"), h("div", { class: "grid" }, archived.map(card)));
+  return root;
+}
+
 // ───────── log a session ─────────
 function openLogDialog() {
   const dlg = $("#dlg"); dlg.replaceChildren();
@@ -328,12 +550,15 @@ function openLogDialog() {
 }
 
 // ───────── chrome ─────────
-const VIEWS = { overview: viewOverview, sessions: viewSessions, projects: viewProjects, reports: viewReports };
+const VIEWS = { overview: viewOverview, day: viewDay, sessions: viewSessions, projects: viewProjects, goals: viewGoals, reports: viewReports };
 let renderToken = 0;
 async function render() {
   const token = ++renderToken;
   document.querySelectorAll("#nav button").forEach((b) => b.classList.toggle("active", b.dataset.view === state.view));
-  $("#custom").hidden = state.preset !== "custom";
+  const ranged = !["day", "goals"].includes(state.view);   // these two tabs have their own date handling
+  $("#range").hidden = !ranged;
+  $("#cat").hidden = state.view === "goals";
+  $("#custom").hidden = !ranged || state.preset !== "custom";
   const view = $("#view");
   try {
     const node = await VIEWS[state.view]();

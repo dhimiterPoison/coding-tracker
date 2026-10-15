@@ -1,6 +1,7 @@
 """SQLite storage. One file, local only."""
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 
@@ -65,6 +66,30 @@ CREATE TABLE IF NOT EXISTS projects (
   category TEXT NOT NULL DEFAULT 'personal',  -- 'work' | 'personal'
   path TEXT,
   notes TEXT
+);
+
+CREATE TABLE IF NOT EXISTS goals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  why TEXT NOT NULL DEFAULT '',
+  metric TEXT NOT NULL DEFAULT 'manual',      -- 'manual' or a key of goals.METRICS (auto-tracked)
+  target_per_week INTEGER NOT NULL DEFAULT 3,
+  active INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL
+);
+
+-- One row per day you closed: your reflection plus a frozen copy of the review as it stood then.
+CREATE TABLE IF NOT EXISTS days (
+  day TEXT PRIMARY KEY,                       -- YYYY-MM-DD (local)
+  closed_at TEXT NOT NULL,
+  feeling INTEGER,                            -- self-rated 1..5
+  win TEXT NOT NULL DEFAULT '',
+  notes TEXT NOT NULL DEFAULT '',
+  next_steps_json TEXT NOT NULL DEFAULT '{}', -- {project: first step for tomorrow}
+  goal_answers_json TEXT NOT NULL DEFAULT '{}', -- {goal_id: {status, note}} for self-reported goals
+  goal_results_json TEXT NOT NULL DEFAULT '{}', -- {goal_id: {status, detail}} for every goal, at close time
+  narrative TEXT NOT NULL DEFAULT '',         -- optional written review (e.g. by Claude via /diary day)
+  snapshot_json TEXT NOT NULL DEFAULT '{}'
 );
 """
 
@@ -133,3 +158,21 @@ def ensure_project(conn: sqlite3.Connection, name: str, path: str | None, defaul
         "INSERT OR IGNORE INTO projects (name, category, path) VALUES (?,?,?)",
         (name, default_cat, path),
     )
+
+
+_DAY_JSON = (("next_steps_json", "next_steps"), ("goal_answers_json", "goal_answers"),
+             ("goal_results_json", "goal_results"), ("snapshot_json", "snapshot"))
+
+
+def get_closed_day(conn: sqlite3.Connection, day: str) -> dict | None:
+    """The closed-day record for a local date, JSON columns decoded, or None if it is still open."""
+    row = conn.execute("SELECT * FROM days WHERE day=?", (day,)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    for col, name in _DAY_JSON:
+        try:
+            d[name] = json.loads(d.pop(col) or "{}") or {}
+        except ValueError:
+            d[name] = {}
+    return d

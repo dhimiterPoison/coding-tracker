@@ -1,6 +1,6 @@
 ---
 name: diary
-description: Work with the user's private coding diary (Coding Diary). Use when the user says /diary, asks to review or wrap up their day ("how did today go", "end of day", "where did I lose focus", "what did I do today/yesterday"), wants a wrap-up note saved for the session, wants to log a manual session, or wants meeting prep (weekly refinement or sprint retro). All data is local.
+description: Work with the user's private coding diary (Coding Diary). Use when the user says /diary, asks to review, close or wrap up their day ("how did today go", "end of day", "where did I lose focus", "what did I do today/yesterday"), asks what to pick up this morning, wants to set or check their goals, wants a wrap-up note saved for the session, wants to log a manual session, or wants meeting prep (weekly refinement or sprint retro). All data is local.
 ---
 
 # Coding Diary
@@ -32,12 +32,30 @@ date). Add `--category work` if the user wants work projects only.
      example "park project-b in a note until 11:00", "write acceptance criteria before the next
      prompt on X"). Compare with the *usual* numbers when the output gives them.
    - **First step tomorrow**: from *Where you left off*, one line per project that has unfinished work.
+   - **Goals**: if the output has a *Goals* section, tie the day to the user's own goals. Say which were
+     met and why, and for each one not met suggest one concrete change. A goal marked "n/a" was not
+     judged (too little activity, or it is self-reported and gets answered when closing the day). Never
+     make up an answer for the user.
 3. Be honest and specific. Cite times and numbers; do not flatter, and do not pad a good day with
    criticism or a bad day with comfort.
 4. Ask one short question at the end only if the data cannot tell you something that matters, for
    example a long gap with no activity ("what happened between 12:00 and 14:30, a meeting?"). Offer
    `/diary log` for anything Claude did not see.
-5. If the user wants it for their notes or standup, give 3–5 plain lines they can paste. Do not edit any
+5. Offer to **close the day**. Closing saves the reflection and a frozen copy of the review (it appears
+   in the dashboard's Day tab, feeds the retro, and gives tomorrow morning its starting point). Ask for
+   these in one message and wait for the answers; never fill them in yourself:
+   - how the day felt, 1–5;
+   - one win (suggest one from *Shipped*, let them change it);
+   - the first step tomorrow per project (suggest from *Where you left off*, let them edit);
+   - for each goal marked self-reported (metric `manual`): met, partly or missed.
+
+   Then run, piping the review you wrote in step 2 on stdin as the narrative (heredoc in bash,
+   here-string in PowerShell):
+
+   `tracker day [--date …] --close --feeling <1-5> --win "<win>" --next "<project>=<step>" [--next …] [--goal <id>=met|partly|missed …] --narrative -`
+
+   Closing again later updates the entry; fields you leave out keep their previous value.
+6. If the user wants it for their notes or standup, give 3–5 plain lines they can paste. Do not edit any
    file for them unless they ask.
 
 How to read the numbers (say so when it matters for a conclusion):
@@ -47,6 +65,26 @@ How to read the numbers (say so when it matters for a conclusion):
 - A **switch** is a prompt that goes to a different project than your previous prompt, across all sessions.
 - A **focus stretch** is consecutive prompts on one project that held 25+ minutes (the threshold is in the config).
 - The diary only sees Claude Code sessions plus what the user logged by hand.
+
+## Goals (`/diary goals`)
+
+The user's goals are *practices* they want to build (senior habits: tests, small commits, planning first,
+protecting focus time, leaving next steps, explaining decisions), not outcomes. Each is judged per day,
+automatically when the diary can see it, or self-reported when closing the day, against a weekly target.
+
+- `tracker goals` lists them with this week's progress; `tracker goals templates` shows ready-made ones.
+- To help the user set goals, ask what they are working toward (for example growing into a senior role),
+  then propose 2–3 practices that would move it. Prefer a tracked metric when one fits. Two or three goals
+  are plenty; more dilutes them.
+- Add one: `tracker goals add "<title>" --metric <metric> --target <days per week> --why "<why it matters>"`.
+  Metrics: `manual`, `focus_block`, `tests`, `small_commits`, `plan_first`, `low_switches`, `next_step`.
+- Retire one: `tracker goals archive <id>` (`restore` brings it back).
+
+## Morning (`/diary morning`)
+
+`tracker morning` prints what to pick up first: the next steps the user wrote when they last closed a day
+(or, failing that, where each recent project stopped) and where their goals stand this week. Read it out
+as a short list, most important first; do not add steps of your own.
 
 ## Wrap-up note (`/diary wrap`)
 

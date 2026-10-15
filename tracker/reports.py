@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 from collections import defaultdict
 
-from . import insights
+from . import goals, insights, journal
 from .insights import _h
 
 
@@ -30,6 +30,9 @@ def refinement(conn: sqlite3.Connection, start: str, end: str, category: str | N
     """What moved per project, where each one stands, what to bring up."""
     sess = insights.load_sessions(conn, start, end, category)
     summ = insights.summarize(sess)
+    steps: dict[str, str] = {}     # latest next step you wrote per project, from closed days
+    for c in journal.reflections(conn, start, end):
+        steps.update({p: t for p, t in c["next_steps"].items() if str(t).strip()})
     sections: list[dict] = []
     T = summ["totals"]
     sections.append({"title": "At a glance", "items": [
@@ -64,6 +67,8 @@ def refinement(conn: sqlite3.Connection, start: str, end: str, category: str | N
         items.append(f"Left off ({last['day']}): {last['last_prompt'] or last['title']}")
         if last["last_assistant"]:
             items.append(f"Last state: {last['last_assistant']}")
+        if name in steps:
+            items.append(f"Next step (your note): {steps[name]}")
         sections.append({"title": f"{name}", "items": items})
     asks = []
     for name, rows in _per_project(sess).items():
@@ -104,6 +109,20 @@ def retro(conn: sqlite3.Connection, start: str, end: str, category: str | None =
         {"title": "Ideas to try next sprint", "items": [c["text"] for c in ov["coach"] if c["kind"] == "tip"]
          or ["Keep the current habits."]},
     ]
+    gsum = goals.range_summary(conn, start, end)
+    if gsum:
+        sections.append({"title": "Goals", "items": [
+            f"{g['title']}: met on {g['met']} of {g['judged']} judged day(s)"
+            + (f", partly on {g['partly']}" if g["partly"] else "")
+            + f" (target about {g['target']})" for g in gsum]})
+    refl = journal.reflections(conn, start, end)
+    wins = [f"{c['day']}: {c['win']}" for c in refl if c.get("win")]
+    if wins:
+        sections.append({"title": "Wins you noted", "items": wins})
+    feels = [c["feeling"] for c in refl if c.get("feeling")]
+    if feels:
+        sections[0]["items"].append(
+            f"How the days felt: {sum(feels) / len(feels):.1f}/5 average over {len(feels)} closed day(s)")
     days = [d for d in summ["by_day"] if d["active_s"] > 0]
     if days:
         best = max(days, key=lambda d: d["flow_s"])

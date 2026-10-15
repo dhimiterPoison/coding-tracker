@@ -6,13 +6,14 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import classify, config, db, insights, manual, reports, sync
+from . import classify, config, db, goals, insights, journal, manual, reports, sync
 
 STATIC = Path(__file__).parent / "static"
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "[::1]", "testserver"}
@@ -143,7 +144,114 @@ def api_report(kind: str, start: str | None = None, end: str | None = None, cate
         return fn(conn, s, e, category)
 
 
+@app.get("/api/day/{day}")
+def api_day(day: str, category: str = "all"):
+    try:
+        with db.session() as conn:
+            return journal.full_review(conn, day, category)
+    except journal.JournalError as e:
+        raise HTTPException(422, str(e))
+
+
+@app.get("/api/days")
+def api_days(start: str | None = None, end: str | None = None, category: str = "all"):
+    s, e = _range(start, end, 14)
+    with db.session() as conn:
+        return journal.list_days(conn, s, e, category)
+
+
+@app.get("/api/morning")
+def api_morning():
+    with db.session() as conn:
+        return journal.morning_card(conn)
+
+
+@app.get("/api/goals")
+def api_goals(window: int = 7):
+    with db.session() as conn:
+        return {"goals": goals.progress(conn, goals.list_goals(conn, active_only=False), date.today().isoformat(),
+                                        max(1, min(window, 90))),
+                "templates": goals.TEMPLATES, "metrics": goals.METRICS}
+
+
 # ───────────── write API ─────────────
+
+class GoalAnswer(BaseModel):
+    status: Literal["met", "partly", "missed"]
+    note: str = Field("", max_length=500)
+
+
+class CloseDay(BaseModel):
+    feeling: int | None = Field(None, ge=1, le=5)
+    win: str | None = Field(None, max_length=1000)
+    notes: str | None = Field(None, max_length=5000)
+    next_steps: dict[str, str] | None = None
+    goal_answers: dict[str, GoalAnswer] | None = None
+    narrative: str | None = Field(None, max_length=20000)
+
+
+@app.post("/api/day/{day}/close")
+def api_close_day(day: str, body: CloseDay, category: str = "all"):
+    answers = {k: v.model_dump() for k, v in (body.goal_answers or {}).items()}
+    try:
+        with db.session() as conn:
+            journal.close_day(conn, day, feeling=body.feeling, win=body.win, notes=body.notes,
+                              next_steps=body.next_steps, goal_answers=answers or None,
+                              narrative=body.narrative, category=category)
+            return journal.full_review(conn, day, category)
+    except journal.JournalError as e:
+        raise HTTPException(422, str(e))
+
+
+@app.delete("/api/day/{day}/close")
+def api_reopen_day(day: str):
+    try:
+        with db.session() as conn:
+            journal.reopen_day(conn, day)
+    except journal.JournalError as e:
+        raise HTTPException(422, str(e))
+    return {"ok": True}
+
+
+class NewGoal(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    why: str = Field("", max_length=1000)
+    metric: str = "manual"
+    target_per_week: int = Field(3, ge=1, le=7)
+
+
+class GoalPatch(BaseModel):
+    title: str | None = Field(None, min_length=1, max_length=200)
+    why: str | None = Field(None, max_length=1000)
+    target_per_week: int | None = Field(None, ge=1, le=7)
+    active: bool | None = None
+
+
+@app.post("/api/goals")
+def api_add_goal(body: NewGoal):
+    try:
+        with db.session() as conn:
+            return {"id": goals.create(conn, body.title, body.why, body.metric, body.target_per_week)}
+    except goals.GoalError as e:
+        raise HTTPException(422, str(e))
+
+
+@app.patch("/api/goals/{gid}")
+def api_patch_goal(gid: int, body: GoalPatch):
+    try:
+        with db.session() as conn:
+            goals.update(conn, gid, **body.model_dump(exclude_unset=True))
+    except goals.GoalError as e:
+        raise HTTPException(404 if "not found" in str(e) else 422, str(e))
+    return {"ok": True}
+
+
+@app.delete("/api/goals/{gid}")
+def api_delete_goal(gid: int):
+    with db.session() as conn:
+        goals.delete(conn, gid)
+    return {"ok": True}
+
 
 class SessionPatch(BaseModel):
     type_override: str | None = None

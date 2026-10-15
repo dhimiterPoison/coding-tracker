@@ -138,20 +138,84 @@ def cmd_today(_args) -> int:
 def cmd_day(args) -> int:
     """End-of-day review: timeline, focus stretches, where flow broke, what shipped, where you left off."""
     from datetime import date
-    from . import day as day_review
+    from . import journal
     try:
         day = date.fromisoformat(args.date).isoformat() if args.date else date.today().isoformat()
     except ValueError:
         print("error: --date must be YYYY-MM-DD", file=sys.stderr)
         return 2
     sync.sync_all()
-    with db.session() as conn:
-        r = day_review.review(conn, day, args.category)
+    try:
+        with db.session() as conn:
+            if args.close:
+                steps = dict(_kv(x) for x in args.next or [])
+                answers = {gid: {"status": st} for gid, st in (_kv(x) for x in args.goal or [])}
+                narrative = sys.stdin.read() if args.narrative == "-" else args.narrative
+                journal.close_day(conn, day, feeling=args.feeling, win=args.win, notes=args.notes,
+                                  next_steps=steps or None, goal_answers=answers or None,
+                                  narrative=narrative, category=args.category)
+                print(f"Day {day} closed.", file=sys.stderr)
+            r = journal.full_review(conn, day, args.category)
+    except (journal.JournalError, ValueError) as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     if args.json:
         r.pop("markdown", None)
         print(json.dumps(r, indent=2, default=str))
     else:
         print(r["markdown"])
+    return 0
+
+
+def _kv(text: str) -> tuple[str, str]:
+    key, sep, val = text.partition("=")
+    if not sep or not key.strip():
+        raise ValueError(f"expected KEY=VALUE, got '{text}'")
+    return key.strip(), val.strip()
+
+
+def cmd_morning(_args) -> int:
+    from . import journal
+    sync.sync_all()
+    with db.session() as conn:
+        card = journal.morning_card(conn)
+    if not card["steps"]:
+        print("Nothing to pick up yet. Close a day with `tracker day --close` to leave yourself next steps.")
+    else:
+        when = "yesterday" if card["days_ago"] == 1 else f"{card['from_day']}"
+        print(f"Pick up where you left off ({when}, {card['source']}):")
+        for s in card["steps"]:
+            print(f"  - [{s['project']}] {s['text']}" + ("  (worked on since)" if s["worked_since"] else ""))
+    for g in card["goals"]:
+        print(f"  goal: {g['title']}: {g['met']}/{g['target']} this week")
+    return 0
+
+
+def cmd_goals(args) -> int:
+    from datetime import date
+    from . import goals
+    with db.session() as conn:
+        try:
+            if args.action == "add":
+                gid = goals.create(conn, args.title, args.why or "", args.metric, args.target)
+                print(f"Added goal {gid}: {args.title}")
+            elif args.action in ("archive", "restore"):
+                goals.update(conn, int(args.title), active=(args.action == "restore"))
+                print(f"Goal {args.title} {'restored' if args.action == 'restore' else 'archived'}.")
+            elif args.action == "templates":
+                for i, t in enumerate(goals.TEMPLATES, 1):
+                    print(f"{i}. {t['title']}  [{t['metric']}, {t['target_per_week']}/week]\n   {t['why']}")
+                print("\nAdd one: tracker goals add \"<title>\" --metric <metric> --target <n>")
+            else:
+                prog = goals.progress(conn, goals.list_goals(conn), date.today().isoformat(), 7)
+                if not prog:
+                    print("No goals yet. See `tracker goals templates`.")
+                for p in prog:
+                    dots = "".join({"met": "●", "partly": "◐", "missed": "○"}[d["status"]] for d in p["dots"])
+                    print(f"{p['id']}. {p['title']}  [{p['metric']}]  week: {p['met']}/{p['target']} {dots}")
+        except (goals.GoalError, ValueError, TypeError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
     return 0
 
 
@@ -184,7 +248,22 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--date", help="YYYY-MM-DD (default today)")
     p.add_argument("--category", default="all", choices=["all", "work", "personal"])
     p.add_argument("--json", action="store_true", help="structured output instead of Markdown")
+    p.add_argument("--close", action="store_true", help="close the day: save your reflection and a frozen review")
+    p.add_argument("--feeling", type=int, choices=range(1, 6), help="how the day felt, 1-5 (with --close)")
+    p.add_argument("--win", help="one win from the day (with --close)")
+    p.add_argument("--notes", help="free notes (with --close)")
+    p.add_argument("--next", action="append", metavar="PROJECT=STEP", help="first step for tomorrow (repeatable)")
+    p.add_argument("--goal", action="append", metavar="ID=met|partly|missed", help="answer a self-reported goal (repeatable)")
+    p.add_argument("--narrative", help="written review to save with the day; '-' reads stdin")
     p.set_defaults(fn=cmd_day)
+    sub.add_parser("morning", help="what to pick up first today").set_defaults(fn=cmd_morning)
+    p = sub.add_parser("goals", help="your goals: list | templates | add | archive | restore")
+    p.add_argument("action", nargs="?", default="list", choices=["list", "templates", "add", "archive", "restore"])
+    p.add_argument("title", nargs="?", help="goal title (add) or goal id (archive/restore)")
+    p.add_argument("--why", help="why it matters to you")
+    p.add_argument("--metric", default="manual", help="manual, focus_block, tests, small_commits, plan_first, low_switches, next_step")
+    p.add_argument("--target", type=int, default=3, help="days per week you aim to meet it")
+    p.set_defaults(fn=cmd_goals)
     p = sub.add_parser("log", help="add a manual session")
     p.add_argument("--project", required=True)
     p.add_argument("--minutes", type=int, required=True)
