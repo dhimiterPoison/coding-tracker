@@ -1,4 +1,4 @@
-"""Command line entry point: `tracker sync | hook | serve | install-hook | stats`."""
+"""Command line entry point: `tracker sync | hook | serve | install-hook | today | day | log | note | report | stats`."""
 from __future__ import annotations
 
 import argparse
@@ -47,7 +47,7 @@ def cmd_serve(args) -> int:
 def cmd_install_hook(args) -> int:
     """Add (or remove) the SessionEnd hook in ~/.claude/settings.json, keeping everything else."""
     settings_path = Path.home() / ".claude" / "settings.json"
-    data = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
+    data = json.loads(settings_path.read_text(encoding="utf-8-sig")) if settings_path.exists() else {}
     exe = Path(sys.executable).with_name("tracker.exe" if sys.platform == "win32" else "tracker")
     command = f'"{exe}" hook'
     hooks = data.setdefault("hooks", {})
@@ -65,7 +65,7 @@ def cmd_install_hook(args) -> int:
     backup = settings_path.with_suffix(".json.bak")
     if settings_path.exists():
         backup.write_text(settings_path.read_text(encoding="utf-8"), encoding="utf-8")
-    settings_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    settings_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     print(("Removed" if args.remove else "Installed") + f" SessionEnd hook in {settings_path} (backup: {backup.name})")
     if not args.remove:
         print(f"Command: {command}")
@@ -128,10 +128,30 @@ def cmd_today(_args) -> int:
         sess = insights.load_sessions(conn, today, today)
         summ = insights.summarize(sess)
     T = summ["totals"]
-    print(f"{today}: {insights._h(T['active_s'])} active, {T['sessions']} session(s), "
-          f"{round(T['flow_ratio'] * 100)}% deep flow, {T['commits']} commit(s)")
+    print(f"{today}: {insights._h(T['clock_s'])} on the clock ({insights._h(T['active_s'])} of session time), "
+          f"{T['sessions']} session(s), {round(T['flow_ratio'] * 100)}% deep flow, {T['commits']} commit(s)")
     for s in sess:
         print(f"  - [{s['project']}] {s['title']} ({s['type']}, {insights._h(s['active_s'])}, {s['focus_label']})")
+    return 0
+
+
+def cmd_day(args) -> int:
+    """End-of-day review: timeline, focus stretches, where flow broke, what shipped, where you left off."""
+    from datetime import date
+    from . import day as day_review
+    try:
+        day = date.fromisoformat(args.date).isoformat() if args.date else date.today().isoformat()
+    except ValueError:
+        print("error: --date must be YYYY-MM-DD", file=sys.stderr)
+        return 2
+    sync.sync_all()
+    with db.session() as conn:
+        r = day_review.review(conn, day, args.category)
+    if args.json:
+        r.pop("markdown", None)
+        print(json.dumps(r, indent=2, default=str))
+    else:
+        print(r["markdown"])
     return 0
 
 
@@ -157,6 +177,11 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_install_hook)
     sub.add_parser("stats", help="print a one-line summary of the diary").set_defaults(fn=cmd_stats)
     sub.add_parser("today", help="print today's sessions").set_defaults(fn=cmd_today)
+    p = sub.add_parser("day", help="end-of-day review (timeline, where flow broke, what to improve)")
+    p.add_argument("--date", help="YYYY-MM-DD (default today)")
+    p.add_argument("--category", default="all", choices=["all", "work", "personal"])
+    p.add_argument("--json", action="store_true", help="structured output instead of Markdown")
+    p.set_defaults(fn=cmd_day)
     p = sub.add_parser("log", help="add a manual session")
     p.add_argument("--project", required=True)
     p.add_argument("--minutes", type=int, required=True)

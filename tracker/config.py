@@ -36,8 +36,8 @@ DEFAULTS = {
 
 def load() -> dict:
     cfg = dict(DEFAULTS)
-    try:
-        cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+    try:   # utf-8-sig: Notepad and PowerShell add a BOM, which plain utf-8 rejects
+        cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig")))
     except (OSError, ValueError):
         pass
     return cfg

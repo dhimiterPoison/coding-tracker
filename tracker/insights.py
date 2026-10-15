@@ -9,23 +9,46 @@ from datetime import date, datetime, timedelta, timezone
 from . import config
 
 SHORT_SESSION_S = 10 * 60
+# Project switches per active day (calibrated on real history: median ~6, top quartile 13+).
+SWITCHY_PER_DAY = 10
+CALM_PER_DAY = 3
 TOTAL_KEYS = ("sessions", "active_s", "flow_s", "wall_s", "prompts", "interruptions", "rejections", "errors",
               "edits", "tests_run", "tokens_in", "tokens_out", "idle_gaps", "area_switches", "topic_shifts")
 # (db column, decoded key, empty value). 'prompts' stays the integer count.
 _JSON_FIELDS = [
     ("blocks_json", "blocks", list), ("commits_json", "commits", list), ("files_json", "files", list),
     ("tool_counts_json", "tool_counts", dict), ("prompts_json", "prompt_list", list),
-    ("work_scores_json", "work_scores", dict),
+    ("work_scores_json", "work_scores", dict), ("marks_json", "marks", list),
+    ("prompt_times_json", "prompt_times", list),
 ]
+# Counters with no timestamp of their own: when a session is cut to a range they are scaled by its time share.
+_SCALED_COUNTERS = ("tool_calls", "edits", "tests_run", "area_switches", "topic_shifts", "errors",
+                    "tokens_in", "tokens_out", "idle_gaps")
 
 
 # ───────────────────────────── loading ─────────────────────────────
 
+def _iso_utc(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _bounds(start: str, end: str) -> tuple[datetime, datetime]:
+    """Local-time [lo, hi) covering the days start..end inclusive."""
+    lo = datetime.fromisoformat(start).astimezone()
+    hi = (datetime.fromisoformat(end) + timedelta(days=1)).astimezone()
+    return lo, hi
+
+
 def load_sessions(conn: sqlite3.Connection, start: str, end: str, category: str | None = None,
                   project: str | None = None, include_hidden: bool = False) -> list[dict]:
+    """Sessions with activity in start..end (local days). A session that runs over several days is
+    cut to the part inside the range, so every day gets only the time actually spent on it."""
+    lo, hi = _bounds(start, end)
     q = ("SELECT s.*, COALESCE(p.category,'personal') AS category FROM sessions s "
-         "LEFT JOIN projects p ON p.name = s.project WHERE s.day >= ? AND s.day <= ?")
-    args: list = [start, end]
+         "LEFT JOIN projects p ON p.name = s.project WHERE "
+         "((s.source = 'manual' AND s.day >= ? AND s.day <= ?) OR "
+         "(s.source != 'manual' AND s.ended_at >= ? AND s.started_at < ?))")
+    args: list = [start, end, _iso_utc(lo), _iso_utc(hi)]
     if not include_hidden:
         q += " AND s.hidden = 0"
     if category and category != "all":
@@ -35,7 +58,60 @@ def load_sessions(conn: sqlite3.Connection, start: str, end: str, category: str 
         q += " AND s.project = ?"
         args.append(project)
     q += " ORDER BY s.started_at"
-    return [decorate(dict(r)) for r in conn.execute(q, args)]
+    flow_min = config.load()["flow_block_minutes"] * 60
+    out = []
+    for r in conn.execute(q, args):
+        s = clip_session(decorate(dict(r)), lo, hi, flow_min)
+        if s is not None:
+            out.append(s)
+    return out
+
+
+def clip_session(s: dict, lo: datetime, hi: datetime, flow_min: float) -> dict | None:
+    """Limit a decorated session to the local window [lo, hi); None if nothing happened inside it."""
+    if s.get("source") == "manual" or not s["blocks"]:
+        return s
+    spans = []
+    for b0, b1 in s["blocks"]:
+        l0, l1 = _local(b0), _local(b1)
+        spans.append((l0, l1, (l1 - l0).total_seconds() >= flow_min))   # flow is decided on the whole block
+    if min(x[0] for x in spans) >= lo and max(x[1] for x in spans) <= hi:
+        return s
+    kept = [(max(a, lo), min(b, hi), f) for a, b, f in spans if max(a, lo) < min(b, hi)]
+    if not kept:
+        return None
+    secs = [(b - a).total_seconds() for a, b, _ in kept]
+    orig = s.get("active_s") or 0
+    frac = sum(secs) / orig if orig else 1.0
+    out = dict(s)
+    out["clipped"] = True
+    out["active_s"] = int(sum(secs))
+    out["flow_s"] = int(sum(sec for sec, (_, _, f) in zip(secs, kept) if f))
+    out["longest_block_s"] = int(max(secs))
+    out["blocks"] = [[_iso_utc(a), _iso_utc(b)] for a, b, _ in kept]
+    out["started_at"], out["ended_at"] = out["blocks"][0][0], out["blocks"][-1][1]
+    out["wall_s"] = int((kept[-1][1] - kept[0][0]).total_seconds())
+    out["day"] = kept[0][0].strftime("%Y-%m-%d")
+
+    def inside(iso: str) -> bool:
+        return lo <= _local(iso) < hi
+
+    if s["prompt_times"]:
+        out["prompt_times"] = [t for t in s["prompt_times"] if inside(t)]
+        out["prompts"] = len(out["prompt_times"])
+        out["marks"] = [m for m in s["marks"] if inside(m["t"])]
+        out["interruptions"] = sum(1 for m in out["marks"] if m["k"] == "interrupt")
+        out["rejections"] = sum(1 for m in out["marks"] if m["k"] == "reject")
+    else:   # row from before prompt times were stored
+        for k in ("prompts", "interruptions", "rejections"):
+            out[k] = round((s.get(k) or 0) * frac)
+    out["commits"] = [c for c in s["commits"] if inside(c["t"])]
+    out["prompt_list"] = [p for p in s["prompt_list"] if inside(p["t"])]
+    for k in _SCALED_COUNTERS:
+        out[k] = round((s.get(k) or 0) * frac)
+    out["focus"] = focus_score(out)
+    out["focus_label"] = focus_label(out["focus"])
+    return out
 
 
 def decorate(s: dict) -> dict:
@@ -88,6 +164,37 @@ def _hour_split(start: datetime, end: datetime):
         cur = nxt
 
 
+def _union_s(spans: list[tuple[datetime, datetime]]) -> int:
+    """Seconds covered by at least one span: overlapping sessions are counted once."""
+    total, cur = 0.0, None
+    for a, b in sorted(spans):
+        if cur is None:
+            cur = [a, b]
+        elif a <= cur[1]:
+            cur[1] = max(cur[1], b)
+        else:
+            total += (cur[1] - cur[0]).total_seconds()
+            cur = [a, b]
+    if cur:
+        total += (cur[1] - cur[0]).total_seconds()
+    return int(total)
+
+
+def _day_pieces(start: datetime, end: datetime):
+    """Yield (local_day, piece_start, piece_end) for an interval, split at local midnight."""
+    cur = start
+    while cur < end:
+        nxt = min(end, cur.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1))
+        yield cur.strftime("%Y-%m-%d"), cur, nxt
+        cur = nxt
+
+
+def count_switches(prompts: list[tuple[datetime, str]]) -> int:
+    """Context switches = times consecutive prompts (across all sessions) go to a different project."""
+    ordered = sorted(prompts)
+    return sum(1 for x, y in zip(ordered, ordered[1:]) if x[1] != y[1])
+
+
 def summarize(sessions: list[dict]) -> dict:
     cfg = config.load()
     flow_min = cfg["flow_block_minutes"] * 60
@@ -97,10 +204,17 @@ def summarize(sessions: list[dict]) -> dict:
     by_day: dict[str, dict] = {}
     hours_active = [0.0] * 24
     hours_flow = [0.0] * 24
-    day_blocks: dict[str, list[tuple[datetime, datetime, str]]] = defaultdict(list)
+    day_spans: dict[str, list[tuple[datetime, datetime]]] = defaultdict(list)
+    day_flow_spans: dict[str, list[tuple[datetime, datetime]]] = defaultdict(list)
+    day_prompts: dict[str, list[tuple[datetime, str]]] = defaultdict(list)
     commits = 0
     short = 0
     longest = 0
+
+    def entry(day: str) -> dict:
+        return by_day.setdefault(day, {
+            "day": day, "active_s": 0, "flow_s": 0, "clock_s": 0, "flow_clock_s": 0, "sessions": set(), "projects": set(),
+            "by_type": defaultdict(int), "interruptions": 0, "prompts": 0, "switches": 0})
 
     for s in sessions:
         for k in TOTAL_KEYS[1:]:
@@ -120,45 +234,68 @@ def summarize(sessions: list[dict]) -> dict:
         p["sessions"] += 1
         p["commits"] += len(s["commits"])
 
-        d = by_day.setdefault(s["day"], {"day": s["day"], "active_s": 0, "flow_s": 0, "sessions": 0,
-                                         "projects": set(), "by_type": defaultdict(int),
-                                         "interruptions": 0})
-        d["active_s"] += a
-        d["flow_s"] += s.get("flow_s") or 0
-        d["sessions"] += 1
-        d["projects"].add(s["project"])
-        d["by_type"][s["type"]] += a
-        d["interruptions"] += s.get("interruptions") or 0
-
         if s["source"] == "manual":
+            d = entry(s["day"])
+            d["active_s"] += a
+            d["flow_s"] += s.get("flow_s") or 0
+            d["sessions"].add(s["id"])
+            d["projects"].add(s["project"])
+            d["by_type"][s["type"]] += a
+            d["interruptions"] += s.get("interruptions") or 0
+            for b0, b1 in s["blocks"]:
+                day_spans[s["day"]].append((_local(b0), _local(b1)))
+                if s.get("flow_s"):
+                    day_flow_spans[s["day"]].append((_local(b0), _local(b1)))
             continue
+
         for b0, b1 in s["blocks"]:
             l0, l1 = _local(b0), _local(b1)
-            day_blocks[l0.strftime("%Y-%m-%d")].append((l0, l1, s["project"]))
             is_flow = (l1 - l0).total_seconds() >= flow_min
+            for day, p0, p1 in _day_pieces(l0, l1):     # a block that crosses midnight feeds both days
+                secs = (p1 - p0).total_seconds()
+                d = entry(day)
+                d["active_s"] += secs
+                d["by_type"][s["type"]] += secs
+                d["sessions"].add(s["id"])
+                d["projects"].add(s["project"])
+                if is_flow:
+                    d["flow_s"] += secs
+                    day_flow_spans[day].append((p0, p1))
+                day_spans[day].append((p0, p1))
             for h, secs in _hour_split(l0, l1):
                 hours_active[h] += secs
                 if is_flow:
                     hours_flow[h] += secs
+        for pt in s["prompt_times"]:
+            lt = _local(pt)
+            day = lt.strftime("%Y-%m-%d")
+            day_prompts[day].append((lt, s["project"]))
+            entry(day)["prompts"] += 1
+        for m in s["marks"]:
+            entry(_local(m["t"]).strftime("%Y-%m-%d"))["interruptions"] += 1
 
-    # Project switches: change of project between consecutive active blocks in a day.
     switches_total = 0
-    for day, blocks in day_blocks.items():
-        blocks.sort()
-        sw = sum(1 for x, y in zip(blocks, blocks[1:]) if x[2] != y[2])
-        switches_total += sw
-        by_day.setdefault(day, {"day": day, "active_s": 0, "flow_s": 0, "sessions": 0, "projects": set(),
-                                "by_type": defaultdict(int), "interruptions": 0})["switches"] = sw
-    for d in by_day.values():
-        d.setdefault("switches", 0)
+    clock_total = 0
+    flow_clock_total = 0
+    for day, d in by_day.items():
+        d["clock_s"] = _union_s(day_spans.get(day, []))
+        d["flow_clock_s"] = _union_s(day_flow_spans.get(day, []))
+        flow_clock_total += d["flow_clock_s"]
+        d["switches"] = count_switches(day_prompts.get(day, []))
+        d["sessions"] = len(d["sessions"])
         d["projects"] = sorted(d["projects"])
-        d["by_type"] = dict(d["by_type"])
+        d["by_type"] = {k: round(v) for k, v in d["by_type"].items()}
+        d["active_s"] = round(d["active_s"])
+        d["flow_s"] = round(d["flow_s"])
+        switches_total += d["switches"]
+        clock_total += d["clock_s"]
 
     active_days = [d for d in by_day.values() if d["active_s"] > 0]
     hrs = t["active_s"] / 3600 or 0
     return {
         "totals": {
             **t, "commits": commits, "short_sessions": short, "longest_block_s": longest,
+            "clock_s": clock_total, "flow_clock_s": flow_clock_total, "parallel_s": max(0, t["active_s"] - clock_total),
             "flow_ratio": round(t["flow_s"] / t["active_s"], 3) if t["active_s"] else 0,
             "interruptions_per_hour": round((t["interruptions"] + t["rejections"]) / hrs, 2) if hrs else 0,
             "project_switches": switches_total,
@@ -205,13 +342,19 @@ def coach(sessions: list[dict], summary: dict, prev: dict | None = None) -> list
                     "Protect that slot for hard problems; keep reviews and chores for the rest."})
     # switching
     sw = T["switches_per_day"]
-    if sw >= 4:
-        msg = f"You switch projects {sw:.1f}× per active day. Each switch costs re-load time; batch work per repo where you can."
+    if sw >= SWITCHY_PER_DAY:
+        msg = (f"You switch projects {sw:.1f}× per active day (a switch = your next prompt goes to a different "
+               "project). Each one costs re-load time; batch work per repo where you can.")
         if prev and prev["totals"]["switches_per_day"]:
             msg += f" (previous period: {prev['totals']['switches_per_day']:.1f})"
         out.append({"kind": "watch", "text": msg})
-    elif T["projects"] > 1 and sw <= 1.5:
+    elif T["projects"] > 1 and sw <= CALM_PER_DAY:
         out.append({"kind": "win", "text": f"Low context switching ({sw:.1f} project switches/day) across {T['projects']} projects."})
+    # parallel sessions
+    if T["active_s"] and T["parallel_s"] / T["active_s"] >= 0.3 and T["clock_s"] >= 3600:
+        out.append({"kind": "tip", "text": f"{round(100 * T['parallel_s'] / T['active_s'])}% of session time overlapped with "
+                    f"another session ({_h(T['clock_s'])} on the clock vs {_h(T['active_s'])} of session time). "
+                    "Parallel threads are fine for agents, but each one needs your attention to be reviewed."})
     # interruptions
     ipr = T["interruptions_per_hour"]
     if ipr >= 1.5:

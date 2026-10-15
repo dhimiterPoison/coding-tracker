@@ -12,6 +12,9 @@ from pathlib import Path
 
 from . import classify, config
 
+PARSER_VERSION = 3   # bump when stored fields change meaning; sync re-parses rows with an older version
+TOPIC_CONTEXT = 4    # a prompt is a topic shift if it shares no keyword with the last N substantive prompts
+TOPIC_MIN_KEYWORDS = 6
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 READ_TOOLS = {"Read", "Grep", "Glob", "NotebookRead"}
 _SKIP_PROMPT_PREFIXES = (
@@ -104,15 +107,47 @@ def _rel(path: str, cwd: str) -> str:
     return p
 
 
-def parse_transcript(path: Path, cfg: dict | None = None) -> dict | None:
-    """Parse a transcript file into a row dict (with 'id' and 'project_path'), or None if not worth keeping."""
+def _records(path: Path):
+    try:
+        fh = open(path, "r", encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    with fh:
+        for line in fh:
+            try:
+                yield json.loads(line)
+            except ValueError:
+                continue
+
+
+def family_of(path: Path) -> str | None:
+    """uuid of the first record. A fork or resume of a chat starts with a copy of its parent's history,
+    so sessions that belong together share this value."""
+    for r in _records(path):
+        if r.get("uuid"):
+            return r["uuid"]
+    return None
+
+
+def uuids_of(path: Path) -> set[str]:
+    return {r["uuid"] for r in _records(path) if r.get("uuid")}
+
+
+def parse_transcript(path: Path, cfg: dict | None = None, skip_uuids: frozenset | set | None = None) -> dict | None:
+    """Parse a transcript file into a row dict (with 'id' and 'project_path'), or None if not worth keeping.
+
+    Records whose uuid is in `skip_uuids` are history copied from an earlier session (a fork) and are
+    ignored, so time, prompts and commits are counted once, in the session that did the work."""
     cfg = cfg or config.load()
+    skip_uuids = skip_uuids or ()
+    family = None
     idle = cfg["idle_gap_minutes"] * 60
     flow_min = cfg["flow_block_minutes"] * 60
 
     events: list[datetime] = []
     prompts: list[tuple[datetime, str]] = []
     interruptions = rejections = errors = tool_calls = edits = tests_run = 0
+    marks: list[dict] = []
     tool_counts: dict[str, int] = {}
     files: dict[str, int] = {}
     edit_areas: list[str] = []
@@ -134,6 +169,11 @@ def parse_transcript(path: Path, cfg: dict | None = None) -> dict | None:
             except ValueError:
                 continue
             t = r.get("type")
+            uid = r.get("uuid")
+            if uid:
+                family = family or uid
+                if uid in skip_uuids:
+                    continue
             if t in ("custom-title", "ai-title", "agent-name"):
                 title = r.get("customTitle") or r.get("aiTitle") or r.get("agentName") or title
                 continue
@@ -194,6 +234,8 @@ def parse_transcript(path: Path, cfg: dict | None = None) -> dict | None:
                         if b.get("is_error"):
                             if "doesn't want to proceed" in text or "tool use was rejected" in text:
                                 rejections += 1
+                                if not side:
+                                    marks.append({"t": _iso(ts), "k": "reject"})
                             else:
                                 errors += 1
                         msg_c = pending_commits.pop(b.get("tool_use_id", ""), None)
@@ -207,6 +249,7 @@ def parse_transcript(path: Path, cfg: dict | None = None) -> dict | None:
                 continue
             if text.startswith("[Request interrupted by user"):
                 interruptions += 1
+                marks.append({"t": _iso(ts), "k": "interrupt"})
                 continue
             if text.startswith("<command-name>"):
                 m = re.search(r"<command-name>(.*?)</command-name>", text, re.S)
@@ -245,16 +288,18 @@ def parse_transcript(path: Path, cfg: dict | None = None) -> dict | None:
 
     # ---- context switching signals ----
     area_switches = sum(1 for a, b in zip(edit_areas, edit_areas[1:]) if a != b)
+    # Short replies ("push", "yes do it") carry no topic; compare substantive prompts against a
+    # rolling window so a follow-up that reuses any recent keyword is not counted as a jump.
     topic_shifts = 0
-    prev_kw: set[str] = set()
+    recent_kw: list[set[str]] = []
     for _, text in prompts:
         kw = _keywords(text)
-        if prev_kw and len(kw) >= 4 and len(prev_kw) >= 4:
-            overlap = len(kw & prev_kw) / len(kw | prev_kw)
-            if overlap < 0.05:
-                topic_shifts += 1
-        if len(kw) >= 4:
-            prev_kw = kw
+        if len(kw) < TOPIC_MIN_KEYWORDS:
+            continue
+        pool = set().union(*recent_kw) if recent_kw else set()
+        if len(pool) >= TOPIC_MIN_KEYWORDS and not (kw & pool):
+            topic_shifts += 1
+        recent_kw = (recent_kw + [kw])[-TOPIC_CONTEXT:]
 
     prompt_texts = [p[1] for p in prompts]
     top_files = [f for f, _ in sorted(files.items(), key=lambda kv: -kv[1])][:40]
@@ -302,6 +347,10 @@ def parse_transcript(path: Path, cfg: dict | None = None) -> dict | None:
         "models": ",".join(sorted(models, key=models.get, reverse=True)[:3]),
         "work_type": work_type,
         "work_scores_json": json.dumps(scores),
+        "prompt_times_json": json.dumps([_iso(ts) for ts, _ in prompts]),
+        "marks_json": json.dumps(sorted(marks, key=lambda m: m["t"])),
+        "parser_version": PARSER_VERSION,
+        "family": family,
         "src_path": str(path),
         "src_size": st.st_size,
         "src_mtime": st.st_mtime,

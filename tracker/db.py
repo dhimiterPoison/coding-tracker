@@ -43,6 +43,10 @@ CREATE TABLE IF NOT EXISTS sessions (
   models TEXT DEFAULT '',
   work_type TEXT DEFAULT 'other',
   work_scores_json TEXT DEFAULT '{}',
+  prompt_times_json TEXT DEFAULT '[]',        -- [iso, ...] every real user prompt (attention signal)
+  marks_json TEXT DEFAULT '[]',               -- [{t, k: 'interrupt'|'reject'}] moments you stopped Claude
+  parser_version INTEGER DEFAULT 0,           -- bumped when the parser changes; stale rows are re-parsed
+  family TEXT,                                -- uuid of the first record: forks/resumes of one chat share it
   -- user-owned fields: never overwritten by re-import
   type_override TEXT,
   rating INTEGER,                             -- self-rated focus 1..5
@@ -72,8 +76,24 @@ PARSED_COLUMNS = [
     "tests_run", "area_switches", "topic_shifts", "commits_json", "files_json",
     "tool_counts_json", "prompts_json", "last_prompt", "last_assistant",
     "tokens_in", "tokens_out", "models", "work_type", "work_scores_json",
+    "prompt_times_json", "marks_json", "parser_version", "family",
     "src_path", "src_size", "src_mtime", "updated_at",
 ]
+
+# Columns added after the first release: CREATE TABLE IF NOT EXISTS never alters an existing table.
+_ADDED_COLUMNS = {
+    "prompt_times_json": "TEXT DEFAULT '[]'",
+    "marks_json": "TEXT DEFAULT '[]'",
+    "parser_version": "INTEGER DEFAULT 0",
+    "family": "TEXT",
+}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(sessions)")}
+    for col, decl in _ADDED_COLUMNS.items():
+        if col not in have:
+            conn.execute(f"ALTER TABLE sessions ADD COLUMN {col} {decl}")
 
 
 def connect() -> sqlite3.Connection:
@@ -82,6 +102,7 @@ def connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
 
 

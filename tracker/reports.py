@@ -33,7 +33,8 @@ def refinement(conn: sqlite3.Connection, start: str, end: str, category: str | N
     sections: list[dict] = []
     T = summ["totals"]
     sections.append({"title": "At a glance", "items": [
-        f"{_h(T['active_s'])} active across {T['sessions']} sessions in {T['projects']} project(s), {start} to {end}.",
+        f"{_h(T['clock_s'])} on the clock ({_h(T['active_s'])} of session time) across {T['sessions']} sessions "
+        f"in {T['projects']} project(s), {start} to {end}.",
         f"{T['commits']} commit(s) made; tests run in {sum(1 for s in sess if s['tests_run'])} session(s).",
     ]})
     for name, rows in sorted(_per_project(sess).items(), key=lambda kv: -sum(r["active_s"] for r in kv[1])):
@@ -89,7 +90,7 @@ def retro(conn: sqlite3.Connection, start: str, end: str, category: str | None =
 
     sections = [
         {"title": "The numbers", "items": [
-            f"Active time: {delta('active_s', _h)}",
+            f"Time on the clock: {delta('clock_s', _h)}",
             f"Deep flow: {round(T['flow_ratio']*100)}% of active time (longest block {_h(T['longest_block_s'])})",
             f"Sessions: {delta('sessions')} across {T['projects']} project(s) on {T['active_days']} day(s)",
             f"Project switches per active day: {T['switches_per_day']}",
