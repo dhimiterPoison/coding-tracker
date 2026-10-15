@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Coding Diary</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23136f63'/%3E%3Cpath d='M9 11l-4 5 4 5M23 11l4 5-4 5M18 9l-4 14' stroke='%23fff' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="rail" aria-label="Main">
+      <div class="brand"><span class="logo" aria-hidden="true">&lt;/&gt;</span><span>Coding Diary</span></div>
+      <nav id="nav">
+        <button data-view="overview" class="active">Overview</button>
+        <button data-view="sessions">Sessions</button>
+        <button data-view="projects">Projects</button>
+        <button data-view="reports">Meeting prep</button>
+      </nav>
+      <p class="privacy">Everything stays on this computer.<br><span id="datadir"></span></p>
+    </aside>
+
+    <main>
+      <header class="bar">
+        <div class="seg" id="range" role="group" aria-label="Date range"></div>
+        <div class="custom" id="custom" hidden>
+          <input type="date" id="from" aria-label="From"> <span>to</span> <input type="date" id="to" aria-label="To">
+        </div>
+        <div class="seg" id="cat" role="group" aria-label="Category"></div>
+        <span class="spacer"></span>
+        <button id="sync" class="ghost" title="Import new Claude Code sessions now">Sync</button>
+        <button id="add" class="primary">Log a session</button>
+      </header>
+      <div id="view" tabindex="-1"></div>
+    </main>
+  </div>
+
+  <aside id="drawer" class="drawer" hidden aria-label="Session details"></aside>
+  <dialog id="dlg"></dialog>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

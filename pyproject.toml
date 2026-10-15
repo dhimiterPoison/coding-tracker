@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coding-tracker"
+version = "0.1.0"
+description = "Local, private diary of your coding sessions (Claude Code transcripts + manual entries)."
+requires-python = ">=3.10"
+dependencies = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
+
+[project.optional-dependencies]
+dev = ["pytest", "httpx"]
+
+[project.scripts]
+tracker = "tracker.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["tracker*"]
+
+[tool.setuptools.package-data]
+tracker = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
