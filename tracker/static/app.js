@@ -107,7 +107,7 @@ function stackedDays(days, r) {
   }
   all.forEach((d, i) => {
     let y = H - B; const x = L + i * bw + bw * 0.14, w = bw * 0.72;
-    const g = svg("g", {}, svg("title", {}, `${dayLabel(d.day)}: ${dur(d.active_s)} active, ${dur(d.flow_s)} deep flow`));
+    const g = svg("g", {}, svg("title", {}, `${dayLabel(d.day)}: ${dur(d.active_s)} of session time (${dur(d.clock_s || 0)} on the clock), ${dur(d.flow_s)} deep flow`));
     for (const [t, s] of Object.entries(d.by_type || {}).sort((p, q) => q[1] - p[1])) {
       const hh = (s / niceMax) * (H - B - T); y -= hh;
       g.append(svg("rect", { x, y, width: w, height: Math.max(hh, 0.5), fill: typeColor(t), rx: 2 }));
@@ -150,7 +150,7 @@ async function viewOverview() {
   root.append(h("h1", {}, "Overview"), h("p", { class: "sub" }, `${r.start} to ${r.end} · compared with the ${Math.round((new Date(r.end) - new Date(r.start)) / 864e5) + 1} days before`));
   if (!T.sessions) { root.append(h("div", { class: "card empty" }, "No sessions in this range. Pick a longer range, press Sync, or log a session manually.")); return root; }
   root.append(h("div", { class: "kpis" },
-    kpi("Active time", dur(T.active_s), delta(T.active_s, P.active_s, { fmt: dur })),
+    kpi("Time on the clock", dur(T.clock_s), delta(T.clock_s, P.clock_s, { fmt: dur }), T.parallel_s > 600 ? `${dur(T.active_s)} of session time (${dur(T.parallel_s)} ran in parallel)` : ""),
     kpi("Deep flow", pct(T.flow_ratio), delta(T.flow_ratio, P.flow_ratio, { fmt: (x) => Math.round(x * 100), unit: " pts" })),
     kpi("Sessions", T.sessions, delta(T.sessions, P.sessions)),
     kpi("Project switches / day", T.switches_per_day, delta(T.switches_per_day, P.switches_per_day, { good: "down", fmt: (x) => x.toFixed(1) })),
@@ -161,7 +161,7 @@ async function viewOverview() {
     h("ul", { class: "coach" }, d.coach.map((c) => h("li", { class: c.kind }, h("span", { class: "badge" }, { win: "Going well", watch: "Watch", tip: "Try" }[c.kind]), h("span", {}, c.text))))));
   const types = Object.keys(d.summary.by_type);
   root.append(h("div", { class: "grid cols-2", style: { marginBottom: "16px" } },
-    h("section", { class: "card" }, h("h2", {}, "Active time per day"), stackedDays(d.summary.by_day, r), legend(types)),
+    h("section", { class: "card" }, h("h2", {}, "Session time per day"), stackedDays(d.summary.by_day, r), legend(types)),
     h("section", { class: "card" }, h("h2", {}, "When you focus"), hourChart(d.summary.by_hour),
       h("div", { class: "legend" }, h("span", {}, h("i", { class: "dot", style: { background: "var(--accent)" } }), "deep flow"), h("span", {}, h("i", { class: "dot", style: { background: "var(--surface-2)", border: "1px solid var(--line)" } }), "any activity")))));
   const maxT = Math.max(...Object.values(d.summary.by_type));
@@ -171,7 +171,7 @@ async function viewOverview() {
     h("section", { class: "card" }, h("h2", {}, "Time by project"), barList(d.summary.by_project.slice(0, 10).map((p) => ({ name: p.project, value: p.active_s, label: dur(p.active_s) })), maxP, "var(--accent)"))));
   return root;
 }
-const kpi = (l, v, d) => h("div", { class: "kpi" }, h("div", { class: "l" }, l), h("div", { class: "v" }, String(v)), d);
+const kpi = (l, v, d, note) => h("div", { class: "kpi" }, h("div", { class: "l" }, l), h("div", { class: "v" }, String(v)), d, note ? h("div", { class: "d" }, note) : null);
 
 async function viewSessions() {
   const r = range();

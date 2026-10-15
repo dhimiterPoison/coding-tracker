@@ -11,16 +11,22 @@ weekly refinement and sprint retros. **No cloud, no telemetry, no external reque
 |---|---|
 | What tasks were worked on? | Your prompts (timeline), commit messages, files edited, Claude's last message ("where it ended") |
 | Interruptions? | You pressing Esc, or rejecting a tool call, per active hour |
-| Context switches? | Project switches between active blocks in a day, jumps between code areas while editing, prompts unrelated to the previous one |
+| Context switches? | A *switch* is a prompt that goes to a different project than your previous prompt (across all sessions), plus jumps between code areas while editing and prompts sharing no keyword with your last few |
 | Flow or distracted? | Active time is split into blocks (a gap over 10 min ends one). Blocks of 25+ min count as deep flow. Score 0-100 = 40% flow share, 25% longest block, 20% few interruptions, 15% few topic jumps. Labels: deep flow (70+), steady (40-69), scattered |
 | Type of work | Keyword + file + tool heuristic: feature, bugfix, refactor, testing, docs, ui-design, devops-config, exploration, review, planning. Override it in the session drawer; your correction survives re-imports |
+
+Three things keep the numbers honest:
+
+- **Forks and resumes** replay their parent's history. Records are de-duplicated by uuid, so a prompt, commit or minute is counted in one session only.
+- **Sessions that span days** are cut at midnight: each day gets only the time actually spent on it.
+- **Parallel sessions**: *time on the clock* counts overlapping sessions once; *session time* adds them up. Both are shown. The clock still includes stretches where Claude ran unattended, so treat it as an upper bound on hands-on time.
 
 You can also log manual sessions (meetings, pairing, anything Claude did not see), self-rate how a session
 felt, and keep private notes.
 
 ## Views
 
-- **Overview**: KPIs vs the previous period, the *Coach* (rule-based wins / watch-outs / things to try), activity per day by work type, when you focus, time by project.
+- **Overview**: KPIs (time on the clock, deep flow, switches, interruptions) vs the previous period, the *Coach* (rule-based wins / watch-outs / things to try), activity per day by work type, when you focus, time by project.
 - **Sessions**: searchable log; click one for prompts, commits, files and notes.
 - **Projects**: every repo with where you left off, 30-day activity and a Work/Personal switch. Good for skimming before standup.
 - **Meeting prep**: a weekly *refinement* draft (per project: shipped, worked on, hot files, left off, things to raise) and a *sprint retro* draft (numbers vs previous sprint, went well / improve / try). Copy as Markdown.
@@ -37,7 +43,7 @@ The app is *copied* into its own virtualenv (`~/.coding-tracker/venv`), so editi
 your running diary. Re-run the installer to upgrade; your data is untouched.
 
 - `--with-hook` adds a `SessionEnd` hook to `~/.claude/settings.json` (a `.bak` copy is written first). Remove it with `tracker install-hook --remove`.
-- `--with-skill` installs `/diary` (wrap-up note, manual log, today/report) into `~/.claude/skills/diary`.
+- `--with-skill` installs `/diary` (end-of-day review, wrap-up note, manual log, reports) into `~/.claude/skills/diary`. `/diary` alone runs the end-of-day review.
 - While the dashboard runs it also re-syncs every 5 minutes, and **Sync** forces it, so nothing is lost if a session was closed abruptly.
 
 ## CLI
@@ -45,7 +51,9 @@ your running diary. Re-run the installer to upgrade; your data is untouched.
 ```
 tracker sync [--force]       import new/changed transcripts
 tracker serve [--port N]     dashboard on 127.0.0.1
-tracker today                today's sessions
+tracker today                today's sessions, one line each
+tracker day [--date D]       end-of-day review: timeline, focus stretches, where flow broke, shipped, where you left off
+                             (--json for structured output, --category work to restrict)
 tracker log --project X --minutes 45 --title "Pairing on auth" --type feature
 tracker note "short progress summary" --cwd .
 tracker report refinement|retro [--category work] [--days N]
@@ -72,4 +80,4 @@ python -m venv .venv && .venv/Scripts/pip install -e ".[dev]"
 ```
 
 Layout: `tracker/parser.py` (transcript → session), `insights.py` (aggregation, scoring, coach),
-`reports.py` (meeting prep), `server.py` + `static/` (dashboard), `cli.py`, `scripts/install.py`.
+`day.py` (end-of-day review), `reports.py` (meeting prep), `server.py` + `static/` (dashboard), `cli.py`, `scripts/install.py`.

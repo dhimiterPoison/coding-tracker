@@ -12,22 +12,25 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_PROJECTS_DIR", str(tmp_path / "claude"))
     import tracker.config as config
     importlib.reload(config)
-    for name in ("db", "sync", "insights", "reports", "server"):
+    for name in ("db", "sync", "insights", "day", "reports", "server"):
         importlib.reload(importlib.import_module(f"tracker.{name}"))
     return tmp_path
 
 
 def make_transcript(path, cwd, events, session_id="sess-1", title=None):
-    """events: list of (minutes_from_start, kind, payload). kinds: prompt, assistant, tool, result, interrupt."""
+    """events: list of (minutes_from_start, kind, payload[, uuid]). kinds: prompt, assistant, tool, result, interrupt.
+    A record's uuid defaults to <session_id>-<n>; pass one to make two transcripts share history (a fork)."""
     t0 = datetime(2026, 10, 12, 9, 0, tzinfo=timezone.utc)
     lines = []
     if title:
         lines.append({"type": "custom-title", "customTitle": title, "sessionId": session_id})
     n = 0
-    for minutes, kind, payload in events:
+    for ev in events:
+        minutes, kind, payload = ev[:3]
         ts = (t0 + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        base = {"timestamp": ts, "sessionId": session_id, "cwd": cwd, "gitBranch": "main", "isSidechain": False}
         n += 1
+        base = {"timestamp": ts, "sessionId": session_id, "cwd": cwd, "gitBranch": "main", "isSidechain": False,
+                "uuid": ev[3] if len(ev) > 3 else f"{session_id}-{n}"}
         if kind == "prompt":
             lines.append({**base, "type": "user", "message": {"role": "user", "content": payload}})
         elif kind == "interrupt":
